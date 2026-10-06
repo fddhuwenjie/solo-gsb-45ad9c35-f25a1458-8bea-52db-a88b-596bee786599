@@ -27,10 +27,18 @@
   (account_id, entry_no) 唯一键保证账户内入账次序连续不重号。
   入账金额取凭证冻结的计费栏（full=+全额、supplement=+应补、
   refund=−应退、no_adjustment=0），账户余额允许为负；
+- account_payments 为家庭应收台账的收款登记：payment_no 主键保证收款单号
+  全平台唯一（同号同账户同金额重试幂等取回首收回执，换金额或跨账户使用
+  判冲突），(account_id, payment_seq) 唯一键保证账户内收款次序连续不重号；
+  每行冻结登记时的逐凭证分配（allocations_json）、累计实收与收款后的
+  尚欠/信用——后续补退凭证不改写旧收款分配，最新尚欠/信用由台账与收款
+  流水重放得出；收款核对与落盘和凭证入账共用同一把写事务锁，
+  并发与进程重启后都不会重复核销；
 - 旧库只有 sessions / session_records 两张表时，session_batches、
-  session_revisions、session_settlement_vouchers 与 account_ledger_entries
-  由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index
-  续报不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
+  session_revisions、session_settlement_vouchers、account_ledger_entries
+  与 account_payments 由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：
+  查询与从 next_index 续报不受影响；已确认区间内没有批次边界可核对，
+  不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -123,6 +131,21 @@ CREATE TABLE IF NOT EXISTS account_ledger_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_account_order
     ON account_ledger_entries(account_id, entry_no);
+CREATE TABLE IF NOT EXISTS account_payments (
+    payment_id TEXT NOT NULL,
+    payment_no TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    payment_seq INTEGER NOT NULL,
+    amount_yuan REAL NOT NULL,
+    allocations_json TEXT NOT NULL,
+    cumulative_received_yuan REAL NOT NULL,
+    outstanding_after_yuan REAL NOT NULL,
+    credit_after_yuan REAL NOT NULL,
+    received_at TEXT NOT NULL,
+    UNIQUE (account_id, payment_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payments_account_order
+    ON account_payments(account_id, payment_seq);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
@@ -505,16 +528,22 @@ class SessionStore:
             (account_id, session_id, voucher_no),
         ).fetchone()
 
+    def list_ledger_entry_rows_in_txn(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> List[sqlite3.Row]:
+        """写事务内按入账次序（entry_no 升序）列出账户全部已记明细。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM account_ledger_entries"
+                " WHERE account_id = ? ORDER BY entry_no",
+                (account_id,),
+            ).fetchall()
+        )
+
     def list_ledger_entry_rows(self, account_id: str) -> List[sqlite3.Row]:
         """按入账次序（entry_no 升序）列出账户全部已记明细。"""
         with self._lock, self._connect() as conn:
-            return list(
-                conn.execute(
-                    "SELECT * FROM account_ledger_entries"
-                    " WHERE account_id = ? ORDER BY entry_no",
-                    (account_id,),
-                ).fetchall()
-            )
+            return self.list_ledger_entry_rows_in_txn(conn, account_id)
 
     def get_voucher_by_no(
         self, conn: sqlite3.Connection, session_id: str, voucher_no: int
@@ -574,6 +603,83 @@ class SessionStore:
                 balance_after_yuan,
                 total_cost_yuan,
                 posted_at,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # 家庭应收台账的收款登记
+    # ------------------------------------------------------------------
+
+    def get_payment_by_no(
+        self, conn: sqlite3.Connection, payment_no: str
+    ) -> Optional[sqlite3.Row]:
+        """按收款单号取已登记收款（单号全平台唯一）；未登记返回 None。"""
+        return conn.execute(
+            "SELECT * FROM account_payments WHERE payment_no = ?",
+            (payment_no,),
+        ).fetchone()
+
+    def count_payments(self, conn: sqlite3.Connection, account_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_payments WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def list_payment_rows_in_txn(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> List[sqlite3.Row]:
+        """写事务内按收款次序（payment_seq 升序）列出账户全部收款。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM account_payments"
+                " WHERE account_id = ? ORDER BY payment_seq",
+                (account_id,),
+            ).fetchall()
+        )
+
+    def list_payment_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按收款次序（payment_seq 升序）列出账户全部收款（只读）。"""
+        with self._lock, self._connect() as conn:
+            return self.list_payment_rows_in_txn(conn, account_id)
+
+    def insert_payment(
+        self,
+        conn: sqlite3.Connection,
+        payment_id: str,
+        payment_no: str,
+        account_id: str,
+        payment_seq: int,
+        amount_yuan: float,
+        allocations_json: str,
+        cumulative_received_yuan: float,
+        outstanding_after_yuan: float,
+        credit_after_yuan: float,
+        received_at: str,
+    ) -> None:
+        """与「核对单号、重放台账、核销分配」同一事务原子落盘收款。
+
+        payment_no 主键使同一收款单号全平台只能登记一次（并发同号只有
+        一份生效，重试取回首收回执）；(account_id, payment_seq) 唯一键
+        保证账户内收款次序不重号。
+        """
+        conn.execute(
+            "INSERT INTO account_payments"
+            "(payment_id, payment_no, account_id, payment_seq, amount_yuan,"
+            " allocations_json, cumulative_received_yuan, outstanding_after_yuan,"
+            " credit_after_yuan, received_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payment_id,
+                payment_no,
+                account_id,
+                payment_seq,
+                amount_yuan,
+                allocations_json,
+                cumulative_received_yuan,
+                outstanding_after_yuan,
+                credit_after_yuan,
+                received_at,
             ),
         )
 

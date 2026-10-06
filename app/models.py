@@ -918,3 +918,87 @@ class LedgerDetailResponse(BaseModel):
     entries: List[LedgerEntryResponse] = Field(
         description="全部已记明细，按入账次序（entry_no 升序）；更正/重试出单不改写旧明细"
     )
+
+
+# ---------------------------------------------------------------------------
+# 家庭应收台账的收款登记：唯一收款单号 + 正金额，按原入账顺序核销正额凭证
+# ---------------------------------------------------------------------------
+
+MAX_PAYMENT_NO_LENGTH = 128
+
+
+class PaymentCreateRequest(BaseModel):
+    """按账户登记一笔到账款：全平台唯一收款单号 + 正金额。"""
+
+    payment_no: str = Field(
+        min_length=1,
+        max_length=MAX_PAYMENT_NO_LENGTH,
+        description="收款单号（全平台唯一）：同一单号永远对应首次登记的账户与金额；"
+        "同单号同账户同金额重试幂等返回首次回执，换金额或跨账户使用返回 409",
+    )
+    amount_yuan: float = Field(
+        gt=0.0, description="收款金额（元），须为正且有限；超过当前应付时整笔拒绝"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "PaymentCreateRequest":
+        if not math.isfinite(self.amount_yuan):
+            raise ValueError("amount_yuan 必须是有限数值")
+        if not self.payment_no.strip():
+            raise ValueError("payment_no 不能为空白字符")
+        return self
+
+
+class PaymentAllocation(BaseModel):
+    """一笔收款分配到某张正额凭证的核销明细。"""
+
+    entry_no: int = Field(description="被核销凭证在账户台账中的入账序号")
+    session_id: str = Field(description="被核销凭证所属执行会话")
+    voucher_no: int = Field(description="被核销凭证在该会话内的出单序号")
+    allocated_yuan: float = Field(description="本次分配到该凭证的金额（可部分付清）")
+
+
+class PaymentRecord(BaseModel):
+    """一笔已登记收款（落盘即冻结：后续补退凭证不改写逐笔分配与回执值）。"""
+
+    payment_id: str = Field(description="收款记录 ID（UUID），落盘后不变")
+    payment_no: str = Field(description="收款单号（全平台唯一）")
+    account_id: str
+    payment_seq: int = Field(description="账户内收款次序（从 1 起，按登记次序连续）")
+    amount_yuan: float = Field(description="收款金额（元）")
+    allocations: List[PaymentAllocation] = Field(
+        description="本次逐凭证分配：按原入账顺序核销尚未付清的正额凭证（可部分付清）"
+    )
+    cumulative_received_yuan: float = Field(description="本笔登记后账户累计实收")
+    outstanding_after_yuan: float = Field(
+        description="本笔登记后账户尚欠（冻结值；最新口径见收款查询接口）"
+    )
+    credit_after_yuan: float = Field(description="本笔登记后账户信用（冻结值）")
+    received_at: str = Field(description="登记时间（UTC ISO 8601）")
+
+
+class PaymentPostResponse(PaymentRecord):
+    """登记收款响应：received=新登记；deduped=同单号同账户同金额重试的首收回执。"""
+
+    result: Literal["received", "deduped"] = Field(
+        description="received=本次新登记并原子落盘；deduped=同一单号+账户+金额的"
+        "重试，原样返回首次回执（冻结值不随后续入账的应补/应退凭证变化）"
+    )
+
+
+class PaymentListResponse(BaseModel):
+    """收款记录查询：冻结的逐笔回执 + 随当前台账重放的账户级尚欠/信用。"""
+
+    account_id: str
+    payment_count: int = Field(description="账户累计收款笔数")
+    total_received_yuan: float = Field(description="账户累计实收（全部收款金额之和）")
+    outstanding_yuan: float = Field(
+        description="最新尚欠：随当前台账凭证重放 = max(0, 台账净应收 − 累计实收)"
+    )
+    credit_yuan: float = Field(
+        description="最新账户信用：= max(0, 累计实收 − 台账净应收)，允许显示信用"
+    )
+    payments: List[PaymentRecord] = Field(
+        description="全部收款记录，按收款次序（payment_seq 升序）；"
+        "逐笔分配与回执值为落盘时冻结的内容"
+    )
