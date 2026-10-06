@@ -456,6 +456,9 @@ def test_empty_account_returns_zero_balance():
         "account_id": "never-used",
         "entry_count": 0,
         "balance_yuan": 0.0,
+        "outstanding_yuan": 0.0,
+        "credit_yuan": 0.0,
+        "total_received_yuan": 0.0,
         "entries": [],
     }
 

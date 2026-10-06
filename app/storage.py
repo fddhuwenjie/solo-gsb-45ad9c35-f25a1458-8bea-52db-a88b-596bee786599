@@ -27,10 +27,19 @@
   (account_id, entry_no) 唯一键保证账户内入账次序连续不重号。
   入账金额取凭证冻结的计费栏（full=+全额、supplement=+应补、
   refund=−应退、no_adjustment=0），账户余额允许为负；
+- account_payments 为账户收款登记：payment_no 为调用方提交的全平台唯一
+  收款单号（主键），整行冻结首次成功时的完整回执 JSON（含逐凭证分配、
+  累计实收与当时尚欠/信用快照）；同一单号 + 同账户 + 同金额重试原样取
+  回首收回执，单号换金额或跨账户复用在数据库层按主键冲突外显式判 409；
+  (account_id, payment_seq) 唯一键保证账户内收款次序连续。
+  account_payment_allocations 记录每笔收款按原入账顺序对正额凭证的逐笔
+  核销（含部分付清），同一写事务内与收款主行一起落盘，使「当前尚欠」
+  可由已入账凭证与已落盘核销重算；超额收款整笔拒绝时两表都不写。
 - 旧库只有 sessions / session_records 两张表时，session_batches、
-  session_revisions、session_settlement_vouchers 与 account_ledger_entries
-  由 CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index
-  续报不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
+  session_revisions、session_settlement_vouchers、account_ledger_entries、
+  account_payments 与 account_payment_allocations 由 CREATE TABLE IF NOT
+  EXISTS 自动补齐（空表）：查询与从 next_index 续报不受影响；已确认区间
+  内没有批次边界可核对，不按前缀猜测去重。
 """
 
 from __future__ import annotations
@@ -123,6 +132,34 @@ CREATE TABLE IF NOT EXISTS account_ledger_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_account_order
     ON account_ledger_entries(account_id, entry_no);
+CREATE TABLE IF NOT EXISTS account_payments (
+    payment_id TEXT NOT NULL,
+    payment_no TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    payment_seq INTEGER NOT NULL,
+    amount_yuan REAL NOT NULL,
+    receipt_json TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (payment_no),
+    UNIQUE (account_id, payment_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payments_account_order
+    ON account_payments(account_id, payment_seq);
+CREATE TABLE IF NOT EXISTS account_payment_allocations (
+    payment_no TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    allocation_no INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    voucher_no INTEGER NOT NULL,
+    entry_no INTEGER NOT NULL,
+    allocated_yuan REAL NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (payment_no, allocation_no),
+    UNIQUE (payment_no, session_id, voucher_no),
+    FOREIGN KEY (payment_no) REFERENCES account_payments(payment_no)
+);
+CREATE INDEX IF NOT EXISTS idx_allocations_voucher
+    ON account_payment_allocations(account_id, session_id, voucher_no);
 """
 
 # 台账表后加列时的轻量迁移：旧库已建表但缺列，按列名幂等 ALTER 补齐。
@@ -576,6 +613,124 @@ class SessionStore:
                 posted_at,
             ),
         )
+
+    def list_ledger_entry_rows_in_txn(
+        self, conn: sqlite3.Connection, account_id: str
+    ) -> List[sqlite3.Row]:
+        """写事务内按入账次序（entry_no 升序）列出账户全部已记明细。"""
+        return list(
+            conn.execute(
+                "SELECT * FROM account_ledger_entries"
+                " WHERE account_id = ? ORDER BY entry_no",
+                (account_id,),
+            ).fetchall()
+        )
+
+    # ------------------------------------------------------------------
+    # 账户收款（收款单幂等 + 逐凭证核销）
+    # ------------------------------------------------------------------
+
+    def get_payment(self, conn: sqlite3.Connection, payment_no: str) -> Optional[sqlite3.Row]:
+        """写事务内按全平台唯一收款单号取收款行；从未提交过返回 None。"""
+        return conn.execute(
+            "SELECT * FROM account_payments WHERE payment_no = ?",
+            (payment_no,),
+        ).fetchone()
+
+    def count_payments(self, conn: sqlite3.Connection, account_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM account_payments WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(row["c"])
+
+    def insert_payment(
+        self,
+        conn: sqlite3.Connection,
+        payment_id: str,
+        payment_no: str,
+        account_id: str,
+        payment_seq: int,
+        amount_yuan: float,
+        receipt_json: str,
+        received_at: str,
+    ) -> None:
+        """与「尚欠核对 → 逐凭证分配」同一事务原子落盘收款主行（含冻结回执）。
+
+        payment_no 主键在数据库层兜底：并发同单号只有一笔成功落盘。
+        """
+        conn.execute(
+            "INSERT INTO account_payments"
+            "(payment_id, payment_no, account_id, payment_seq, amount_yuan,"
+            " receipt_json, received_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                payment_id,
+                payment_no,
+                account_id,
+                payment_seq,
+                amount_yuan,
+                receipt_json,
+                received_at,
+            ),
+        )
+
+    def insert_payment_allocation(
+        self,
+        conn: sqlite3.Connection,
+        payment_no: str,
+        account_id: str,
+        allocation_no: int,
+        session_id: str,
+        voucher_no: int,
+        entry_no: int,
+        allocated_yuan: float,
+        received_at: str,
+    ) -> None:
+        """与收款主行同一事务落盘一条逐凭证核销（可部分付清）。"""
+        conn.execute(
+            "INSERT INTO account_payment_allocations"
+            "(payment_no, account_id, allocation_no, session_id, voucher_no,"
+            " entry_no, allocated_yuan, received_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payment_no,
+                account_id,
+                allocation_no,
+                session_id,
+                voucher_no,
+                entry_no,
+                allocated_yuan,
+                received_at,
+            ),
+        )
+
+    def list_payment_rows(self, account_id: str) -> List[sqlite3.Row]:
+        """按收款次序（payment_seq 升序）列出账户全部已落盘收款行。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM account_payments"
+                    " WHERE account_id = ? ORDER BY payment_seq",
+                    (account_id,),
+                ).fetchall()
+            )
+
+    def sum_cash_by_voucher(
+        self,
+        conn: sqlite3.Connection,
+        account_id: str,
+        session_id: str,
+        voucher_no: int,
+    ) -> float:
+        """写事务内汇总某张已入账凭证名下全部已落盘收款核销额（用于重算尚欠）。"""
+        row = conn.execute(
+            "SELECT COALESCE(SUM(allocated_yuan), 0.0) AS s"
+            " FROM account_payment_allocations"
+            " WHERE account_id = ? AND session_id = ? AND voucher_no = ?",
+            (account_id, session_id, voucher_no),
+        ).fetchone()
+        return float(row["s"])
 
 
 _store: Optional[SessionStore] = None

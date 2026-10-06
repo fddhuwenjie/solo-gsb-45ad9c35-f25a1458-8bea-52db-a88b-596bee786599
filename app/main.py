@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.audit import audit_telemetry
-from app.ledger import LedgerError, get_ledger, post_vouchers
+from app.ledger import LedgerError, post_vouchers
 from app.models import (
     BatchAppendRequest,
     BatchAppendResponse,
@@ -17,6 +17,9 @@ from app.models import (
     LedgerDetailResponse,
     LedgerPostRequest,
     LedgerPostResponse,
+    PaymentListResponse,
+    PaymentReceiptResponse,
+    PaymentRequest,
     ReplanRequest,
     ReplanResponse,
     RevisionCreateRequest,
@@ -33,6 +36,7 @@ from app.models import (
     VoucherIssueRequest,
     VoucherListResponse,
 )
+from app.payments import PaymentError, ledger_detail_with_position, list_payments, submit_payment
 from app.replan import ReplanError, execute_replan
 from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
@@ -71,9 +75,18 @@ app = FastAPI(
         "（首单/应补增净应收、应退减净应收、零调整不变，余额允许为负），"
         "一个会话从首张凭证起连续记入同一账户、同批可补齐前序，不存在、跳号、"
         "跨账户或重复使整批拒绝，并发入账不重复计费；提供按入账次序查询明细"
-        "与余额的接口，明细与余额持久化、重启后仍在。"
+        "与余额的接口，明细与余额持久化、重启后仍在；"
+        "/accounts/{账户ID}/payments 按账户登记收款（全平台唯一收款单号 + "
+        "正金额）：先用已记应退凭证按原入账顺序抵减尚未付清的正额凭证，"
+        "剩余应退形成账户信用，再把收款按原入账顺序 FIFO 分配给未付清的"
+        "正额凭证（可部分付清），超过当前应付的收款整笔拒绝且不留流水；"
+        "返回逐凭证分配、累计实收及最新尚欠/信用，并提供收款记录查询；"
+        "同单号同账户同金额重试返回首次冻结回执（即使后来入账新凭证），"
+        "单号换金额或跨账户使用返回 409；后续补退不改写旧收款分配，"
+        "最新尚欠随凭证变化、允许显示信用；收款核对与落盘和原入账共用"
+        "同一 SQLite 写事务，并发与重启后都不会重复核销。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -151,6 +164,17 @@ async def voucher_error_handler(request: Request, exc: VoucherError):
 async def ledger_error_handler(request: Request, exc: LedgerError):
     body = {"error": exc.code, "reason": str(exc)}
     # 附加字段（如不合法凭证的 session_id/voucher_no、已入账账户）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+    )
+
+
+@app.exception_handler(PaymentError)
+async def payment_error_handler(request: Request, exc: PaymentError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如冲突单号的已登记账户/金额、超额时的当前尚欠/信用）随错误体顶层返回
     body.update(exc.extra)
     return JSONResponse(
         status_code=exc.status_code,
@@ -476,11 +500,72 @@ async def post_account_ledger(account_id: str, req: LedgerPostRequest) -> Ledger
     tags=["ledger"],
 )
 async def get_account_ledger(account_id: str) -> LedgerDetailResponse:
-    """按入账次序（entry_no 升序）查询账户全部已记明细与累计净应收。
+    """按入账次序（entry_no 升序）查询账户全部已记明细、累计净应收与最新头寸。
 
-    账户无需预先创建：从未入账的账户返回空明细与余额 0；明细与余额持久化在
-    SQLite 中，进程重启后仍可查询。每条明细的金额/计费栏均为凭证入账时的冻结值，
-    后续计量表更正、重试或新凭证出单都不改写旧明细。
+    账户无需预先创建：从未入账的账户返回空明细、余额 0、尚欠 0、信用 0；
+    明细与余额持久化在 SQLite 中，进程重启后仍可查询。每条明细的金额/计费栏/
+    入账后余额快照均为凭证入账时的冻结值，后续计量表更正、重试或新凭证出单、
+    以及后来的应补/应退凭证与收款都不改写旧明细；明细另附逐凭证最新重算的
+    应收/应退抵减/已收款/尚欠，账户级附最新尚欠 outstanding_yuan、信用
+    credit_yuan（应退抵减剩余，两者不同时为正）与累计实收 total_received_yuan。
     """
-    result = get_ledger(account_id)
+    result = ledger_detail_with_position(account_id)
     return LedgerDetailResponse.model_validate(result)
+
+
+# ---------------------------------------------------------------------------
+# 账户收款登记：应退抵减 → 信用 → 按原入账顺序 FIFO 逐凭证核销
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/accounts/{account_id}/payments",
+    response_model=PaymentReceiptResponse,
+    responses={
+        409: {"model": ErrorResponse, "description": "收款单号已用于别的账户或别的金额"},
+        422: {"model": ErrorResponse, "description": "金额非正、账户无台账或收款超过当前应付（整笔拒绝不留流水）"},
+    },
+    tags=["ledger"],
+)
+async def post_account_payment(account_id: str, req: PaymentRequest) -> PaymentReceiptResponse:
+    """按账户登记一笔收款并逐凭证核销。
+
+    - 先用账户内已记应退凭证按原入账顺序抵减尚未付清的正额凭证（full/supplement），
+      抵减后剩余的应退形成账户信用 credit_yuan；再把收款按原入账顺序
+      （entry_no 升序）分配给尚未付清的正额凭证，可只部分付清一张；
+    - 收款金额超过当前应付 outstanding_yuan（账户只有信用、没有未付清正额时
+      任何正金额都算超额）→ 422 payment_exceeds_outstanding，错误体附当前
+      尚欠/信用，**整笔拒绝、不登记收款单、不留任何逐凭证分配流水**；
+    - 同一 payment_no + 同账户 + 同金额重试 → result=deduped，返回首次成功时
+      冻结的回执（逐凭证分配、累计实收与当时尚欠/信用快照都不随后续新入账的
+      应补/应退凭证漂移）；同一单号换金额或跨账户使用 → 409 payment_no_conflict，
+      错误体附已登记的 account_id / amount_yuan，不写入；
+    - 后续补退不改写旧收款分配：逐凭证核销落盘即冻结；最新尚欠/信用于每次
+      请求时由当前全部凭证与已落盘核销重算，允许显示信用；
+    - 核对、逐凭证分配与落盘和原凭证入账共用同一 SQLite 写事务（RLock +
+      BEGIN IMMEDIATE），payment_no 主键兜底：并发同单号只有一笔落盘，
+      进程重启后核销仍在、不会重复核销。
+    """
+    result = submit_payment(
+        account_id=account_id,
+        payment_no=req.payment_no,
+        amount_yuan=req.amount_yuan,
+    )
+    return PaymentReceiptResponse.model_validate(result)
+
+
+@app.get(
+    "/accounts/{account_id}/payments",
+    response_model=PaymentListResponse,
+    tags=["ledger"],
+)
+async def list_account_payments(account_id: str) -> PaymentListResponse:
+    """按收款次序（payment_seq 升序）查询账户全部收款记录与当前最新头寸。
+
+    每条记录均为首次成功时冻结的回执（逐凭证分配、累计实收与当时尚欠/信用
+    快照）；账户级 total_received_yuan 为当前累计实收，outstanding_yuan /
+    credit_yuan 为按当前全部凭证与已落盘核销重算的最新值（后续补退会改变
+    它们，但不改写任何历史收款记录）。从未入账也无收款的账户返回全 0/空。
+    """
+    result = list_payments(account_id)
+    return PaymentListResponse.model_validate(result)
